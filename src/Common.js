@@ -3,6 +3,9 @@ if( typeof wTools === 'undefined' )
 require( '../node_modules/Joined.s' );
 const _ = wTools;
 const GithubActionsParser = require( 'github-actions-parser' );
+const fs = require( 'fs' );
+const path = require( 'path' );
+const childProcess = require( 'child_process' );
 
 //
 
@@ -49,35 +52,146 @@ function remotePathForm( name, token )
 
 function actionClone( localPath, remotePath )
 {
-  if( !_.fileProvider.fileExists( localPath ) )
-  {
-    const con = _.take( null );
-    con.then( () =>
-    {
-      return _.git.repositoryClone
-      ({
-        remotePath,
-        localPath,
-        sync : 0,
-        attemptLimit : 4,
-        attemptDelay : 500,
-        attemptDelayMultiplier : 4,
-      });
-    });
-    con.then( () =>
-    {
-      if( remotePath.tag !== 'master' )
-      return _.git.tagLocalChange
-      ({
-        localPath,
-        tag : remotePath.tag,
-        sync : 0
-      });
-      return true;
-    });
-    return con;
-  }
+  if( _.fileProvider.fileExists( localPath ) )
   return null;
+
+  if( actionCacheRead( localPath, remotePath ) )
+  return null;
+
+  const con = _.take( null );
+  con.then( () =>
+  {
+    return _.git.repositoryClone
+    ({
+      remotePath,
+      localPath,
+      sync : 0,
+      attemptLimit : 4,
+      attemptDelay : 500,
+      attemptDelayMultiplier : 4,
+    });
+  });
+  con.then( () =>
+  {
+    if( remotePath.tag !== 'master' )
+    return _.git.tagLocalChange
+    ({
+      localPath,
+      tag : remotePath.tag,
+      sync : 0
+    });
+    return true;
+  });
+  con.then( () => { actionCacheWrite( localPath, remotePath ); return true; });
+  return con;
+}
+
+//
+
+function resolveShaFromRemote( remotePath )
+{
+  try
+  {
+    const url = `https://github.com/${ remotePath.repo }.git`;
+    const out = childProcess.execSync( `git ls-remote "${ url }" "${ remotePath.tag }"`, { timeout : 10000 } ).toString().trim();
+    const firstLine = out.split( '\n' )[ 0 ];
+    return firstLine ? firstLine.split( '\t' )[ 0 ] : null;
+  }
+  catch( ex )
+  {
+    return null;
+  }
+}
+
+//
+
+function resolveClonedSha( localPath )
+{
+  try
+  {
+    return childProcess.execSync( 'git rev-parse HEAD', { cwd : localPath } ).toString().trim();
+  }
+  catch( ex )
+  {
+    return null;
+  }
+}
+
+//
+
+function actionCacheRead( localPath, remotePath )
+{
+  const cacheDir = process.env[ 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE' ];
+  if( !cacheDir || !fs.existsSync( cacheDir ) )
+  return false;
+
+  const sha = resolveShaFromRemote( remotePath );
+  if( !sha )
+  return false;
+
+  const repoKey = remotePath.repo.replace( /[/\\]/g, '_' );
+  const ext = process.platform === 'win32' ? '.zip' : '.tar.gz';
+  const archivePath = path.join( cacheDir, repoKey, sha + ext );
+  if( !fs.existsSync( archivePath ) )
+  return false;
+
+  try
+  {
+    fs.mkdirSync( localPath, { recursive : true } );
+    if( process.platform === 'win32' )
+    {
+      childProcess.execSync( `powershell -Command "Expand-Archive -Path '${ archivePath }' -DestinationPath '${ localPath }' -Force"` );
+    }
+    else
+    {
+      childProcess.execSync( `tar -xzf "${ archivePath }" -C "${ localPath }" --strip-components=1` );
+    }
+    core.info( `Loaded action from archive cache: ${ archivePath }` );
+    return true;
+  }
+  catch( ex )
+  {
+    core.warning( `Failed to use action archive cache: ${ ex.message }` );
+    return false;
+  }
+}
+
+//
+
+function actionCacheWrite( localPath, remotePath )
+{
+  const cacheDir = process.env[ 'ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE' ];
+  if( !cacheDir || !fs.existsSync( cacheDir ) )
+  return;
+
+  const sha = resolveClonedSha( localPath );
+  if( !sha )
+  return;
+
+  const repoKey = remotePath.repo.replace( /[/\\]/g, '_' );
+  const repoCacheDir = path.join( cacheDir, repoKey );
+  const ext = process.platform === 'win32' ? '.zip' : '.tar.gz';
+  const archivePath = path.join( repoCacheDir, sha + ext );
+
+  try
+  {
+    fs.mkdirSync( repoCacheDir, { recursive : true } );
+    if( process.platform === 'win32' )
+    {
+      childProcess.execSync( `powershell -Command "Compress-Archive -Path '${ localPath }\\*' -DestinationPath '${ archivePath }' -Force"` );
+    }
+    else
+    {
+      const parentDir = path.dirname( localPath );
+      const folderName = path.basename( localPath );
+      childProcess.execSync( `tar -czf "${ archivePath }" -C "${ parentDir }" "${ folderName }"` );
+    }
+    core.info( `Saved action to archive cache: ${ archivePath }` );
+  }
+  catch( ex )
+  {
+    core.warning( `Failed to save action to archive cache: ${ ex.message }` );
+  }
 }
 
 //
@@ -259,6 +373,10 @@ const Self =
   commandsForm,
   remotePathForm,
   actionClone,
+  actionCacheRead,
+  actionCacheWrite,
+  resolveClonedSha,
+  resolveShaFromRemote,
   actionConfigRead,
   actionOptionsParse,
   optionsExtendByInputDefaults,
